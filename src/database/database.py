@@ -214,7 +214,7 @@ class NetworkDatabase:
                 return None
             
     def add_or_update_device(self, network_id: int, ip_address: str,
-                             mac_address: str = None, hostname: str = None) -> int:
+                             mac_address: Optional[str] = None, hostname: Optional[str] =None) -> int:
         """
         Add new device or update existing device information.
         
