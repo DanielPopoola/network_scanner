@@ -123,6 +123,8 @@ class NetworkDatabase:
             protocol TEXT NOT NULL,
             service_name TEXT,
             service_version TEXT,
+            service_product TEXT,
+            service_extrainfo TEXT,
             state TEXT NOT NULL,
             FOREIGN KEY (device_id) REFERENCES devices (device_id)
             UNIQUE(device_id, port_number, protocol)

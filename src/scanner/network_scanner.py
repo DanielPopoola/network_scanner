@@ -1,13 +1,12 @@
 import nmap
 import logging
 import ipaddress
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 from datetime import datetime
 import time
-import xml.etree.ElementTree as ET
 
-from src.database.database import NetworkDatabase, DeviceInfo
+from src.database.database import NetworkDatabase
 
 
 logging.basicConfig(level=logging.INFO)
@@ -231,7 +230,7 @@ class NetworkScanner:
                 nmap_args = '-sV --top-ports 1000 -T4'
                 timeout = 60  # 1 minute quick scan
             elif scan_type == 'full':
-                nmap_args = '-sV -p- -T4'
+                nmap_args = '-sV -sC --version-all -p- -T4'
                 timeout = self.scan_timeout  # 5 minutes for full scan
             else:
                 nmap_args = '-sV --top-ports 1000 -T4'
@@ -285,7 +284,7 @@ class NetworkScanner:
                     if port_data['state'] == 'open':
                         ports.append(port_data)
 
-            logger.info(f"Scan completed for {ip_address} in {scan_duration:1.f}s: "
+            logger.info(f"Scan completed for {ip_address} in {scan_duration:1.1f}s: "
                         f"{len(ports)} open ports found")
             
             return HostScanResult(
@@ -370,13 +369,13 @@ if __name__ == "__main__":
                     ("Test Company", "admin@testcompany.com"))
         
         cursor = conn.execute("INSERT OR IGNORE INTO networks (customer_id, network_cidr, description) VALUES (?, ?, ?)",
-                             (1, "192.168.1.0/24", "Test network"))
+                             (1, "192.168.1.0/24", "Server network"))
         network_id = cursor.lastrowid or 1
         conn.commit()
 
     # Perform test scan (adjust network range to match your environment)
     try:
-        test_network = "127.0.0.0/30"  # Only localhost range for testing
+        test_network = "192.168.1.0/24" 
         
         print(f"Starting scan of {test_network}...")
         result = scanner.scan_network(test_network, network_id)
