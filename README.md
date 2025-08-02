@@ -19,7 +19,7 @@ This project is a network scanner that identifies devices on a network, catalogs
 
 1.  Clone the repository:
     ```bash
-    git clone git@github.com:DanielPopoola/network_scanner.git
+    git clone https://github.com/DanielPopoola/network_scanner.git
     ```
 2.  Navigate to the project directory:
     ```bash
