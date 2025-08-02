@@ -362,20 +362,19 @@ if __name__ == "__main__":
     db = NetworkDatabase("src/database/network_scanner.db")
     scanner = NetworkScanner(db)
 
-    # Set up test data (normally done through configuration)
     with db.get_connection() as conn:
         # Add test customer and network
         conn.execute("INSERT OR IGNORE INTO customers (customer_name, contact_email) VALUES (?, ?)",
                     ("Test Company", "admin@testcompany.com"))
         
         cursor = conn.execute("INSERT OR IGNORE INTO networks (customer_id, network_cidr, description) VALUES (?, ?, ?)",
-                             (1, "192.168.1.0/24", "Server network"))
+                             (1, "127.0.0.1/30", "Server network"))
         network_id = cursor.lastrowid or 1
         conn.commit()
 
     # Perform test scan (adjust network range to match your environment)
     try:
-        test_network = "192.168.1.0/24" 
+        test_network = "127.0.0.1/30" 
         
         print(f"Starting scan of {test_network}...")
         result = scanner.scan_network(test_network, network_id)
