@@ -1,341 +1,239 @@
 import nmap
-import logging
 import ipaddress
-from typing import List, Dict, Optional
+import asyncio
+import concurrent.futures
+from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-import json
+import threading
+from logger_config import setup_logger
 
+logs = 'logs/scanner.log'
+logger = setup_logger(__name__, log_file_path=logs)
 
+try:
+    from pythonping import ping
+    PING_AVAILABLE = True
+except ImportError:
+    PING_AVAILABLE = False
+    logger.warning("pythonping not available. Install with: pip install pythonping")
+
+# Import our database module
 from src.database.database import NetworkDatabase
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 @dataclass
-class ScanTask:
-    """Represents a scanning task for the thread pool."""
-    ip_address: str
-    device_id: Optional[int]
-    scan_type: str # 'discovery', 'quick', 'full'
-    network_id: int
-    priority: int = 1   # lower number = Higher priority
-
-
-@dataclass
-class OptimizedScanResult:
-    """Results from an optimized network scan."""
+class ScanResult:
+    """Results from a network scan operation."""
     network_cidr: str
     scan_start: datetime
     scan_end: datetime
-    total_hosts_attempted: int
-    successful_scans: int
-    failed_scans: int
+    live_hosts_found: int
     new_devices: int
-    devices_with_changes: int
+    devices_needing_full_scan: int
     total_ports_discovered: int
-    parallel_workers_used: int
     errors: List[str]
+    performance_stats: Dict[str, float]
+
+@dataclass
+class HostScanResult:
+    """Results from scanning a single host."""
+    ip_address: str
+    is_alive: bool
+    ports: List[Dict]
+    hostname: Optional[str] = None
+    mac_address: Optional[str] = None
+    scan_error: Optional[str] = None
+    scan_duration: float = 0.0
 
 
 class OptimizedNetworkScanner:
     """
-    High-performance network scanner with parallel processing.
+    High-performance network scanner using async pings and threaded Nmap scans.
     
-    Key optimizations:
-    1. Parallel host scanning using ThreadPoolExecutor
-    2. Batch processing and smart scheduling
-    3. Connection pooling for database operations
-    4. Configurable scan intervals and priorities
+    This scanner optimizes for real-world enterprise networks by:
+    1. Using async pings for fast host discovery
+    2. Threading Nmap scans for parallel port scanning
+    3. Auto-configuring thread counts based on network size
+    4. Maintaining smart scan logic with performance optimization
     """
-    
-    def __init__(self, database: NetworkDatabase, max_workers: int = 10):
+
+    def __init__(self, database: NetworkDatabase, max_threads: Optional[int] = None):
         """
-        Initialize the optimized scanner.
+        Initialize the optimized network scanner.
         
         Args:
-            database: NetworkDatabase instance
-            max_workers: Maximum parallel scanning threads (default: 10)
+            database: NetworkDatabase instance for storing results
+            max_threads: Maximum threads to use (auto-calculated if None)
         """
         self.db = database
-        self.max_workers = max_workers
-        self.scan_timeout = 600  # 5 mins per host
-        self.discovery_timeout = 120
-
-        # Thread-local storage for Nmap instances
-        self._local = threading.local()
-
-        # Scan scheduling configuration
-        self.quick_scan_interval = timedelta(hours=4)
-        self.full_scan_interval = timedelta(days=1)
-
-        logger.info(f"OptimizedNetworkScanner initialized with {max_workers} workers")
-    
-    def _get_nmap_scanner(self):
-        """Get thread-local Nmap scanner"""
-        if not hasattr(self._local, 'nm'):
-            self._local.nm = nmap.PortScanner()
-        return self._local.nm
-    
-    def scan_network_optimized(self, network_cidr: str, network_id: int) -> OptimizedScanResult:
-        """
-        Perform optimized parallel network scan.
+        self.max_threads = max_threads
+        self.scan_timeout = 600  # 5 minutes per host max
+        self.ping_timeout = 3    # 3 seconds per ping
+        self.ping_count = 1      # Single ping per host for speed
         
-        Strategy:
-        1. Fast discovery of all live hosts (parallel)
-        2. Classify hosts and create scan tasks
-        3. Execute scan tasks in parallel with priority queue
-        4. Batch database updates
+        # Thread-safe Nmap instances (one per thread)
+        self._nmap_instances = {}
+        self._lock = threading.Lock()
+        
+        logger.info(f"OptimizedNetworkScanner initialized (max_threads: {max_threads})")
+
+    def _get_nmap_instance(self) -> nmap.PortScanner:
+        """Get thread-local Nmap instance."""
+        thread_id =  threading.current_thread().ident
+
+        if thread_id not in self._nmap_instances:
+            with self._lock:
+                if thread_id not in self._nmap_instances:
+                    self._nmap_instances[thread_id] = nmap.PortScanner()
+
+        return self._nmap_instances[thread_id]
+    
+    def _calculate_thread_count(self, host_count: int) -> int:
+        """
+        Calculate optimal thread count based on network size.
         
         Args:
-            network_cidr: Network to scan
-            network_id: Database ID of the network
+            host_count: Number of hosts to scan
             
         Returns:
-            OptimizedScanResult with performance metrics
+            Optimal number of threads
         """
-        scan_start = datetime.now()
-        errors = []
-        successful_scans = 0
-        failed_scans = 0
-        new_devices = 0
-        devices_with_changes = 0
-        total_ports = 0
-        live_hosts = []
+        if self.max_threads:
+            return min(self.max_threads, host_count)
+        
+        # Auto-calculate based on host count
+        if host_count <= 5:
+            return 2
+        elif host_count <= 20:
+            return 5
+        elif host_count <= 50:
+            return 10
+        elif host_count <= 100:
+            return 15
+        else:
+            return 20
 
-        logger.info(f"Starting optimized scan of {network_cidr} with {self.max_workers} workers")
-
-        try:
-            # Parallel Host Discovery
-            logger.info("Parallel host discovery...")
-            live_hosts = self._discover_hosts_parallel(network_cidr)
-            logger.info(f"Discovered {len(live_hosts)} live hosts")
-
-            if not live_hosts:
-                return self._create_empty_result(network_cidr, scan_start, "No live hosts found")
+    async def ping_host_async(self, ip_address: str) -> Tuple[str, bool, Optional[str]]:
+        """
+        Asynchronously ping a single host.
+        
+        Args:
+            ip_address: IP address to ping
             
-            # Create Scan Tasks with Smart Scheduling
-            logger.info("Creating scan tasks...")
-            scan_tasks = self._create_scan_tasks(live_hosts, network_id)
-            logger.info(f"Created {len(scan_tasks)} scan tasks")
-
-            # Execute Scan Tasks in Parallel
-            logger.info(f"Executing scan tasks in parallel")
-            scan_results = self._execute_scan_tasks_parallel(scan_tasks)
-
-            logger.info("Phase 4: Processing quick scan results...")
-            full_scan_tasks = []  # Collect devices needing full scan
-
-            for result in scan_results:
-                if result['success']:
-                    successful_scans += 1
-
-                    # Process the scan result (without doing full scans yet)
-                    device_result = self._process_scan_result_without_full_scan(result, network_id)
-                    
-                    if device_result['is_new_device']:
-                        new_devices += 1
-                    if device_result['ports_changed']:
-                        devices_with_changes += 1
-
-                        # If this was a quick scan with changes → add to full scan batch
-                        if result['scan_type'] == 'quick':
-                            full_scan_tasks.append(ScanTask(
-                                ip_address=result['ip_address'],
-                                device_id=device_result['device_id'],
-                                scan_type='full',
-                                network_id=network_id,
-                                priority=1  # High priority for change-triggered scans
-                            ))
-
-                    total_ports += device_result['port_count']
-                else:
-                    failed_scans += 1
-                    errors.append(result['error'])
-                
-            if full_scan_tasks:
-                logger.info(f"Executing {len(full_scan_tasks)} full scans in parallel...")
-                full_scan_results = self._execute_scan_tasks_parallel(full_scan_tasks)
-                
-                # Process full scan results
-                for full_result in full_scan_results:
-                    if full_result['success']:
-                        # Update database with full scan results
-                        full_device_result = self._process_full_scan_result(full_result, network_id)
-                        total_ports += full_device_result['additional_ports']
-                    else:
-                        errors.append(f"Full scan failed: {full_result['error']}")
-                
-                logger.info(f"Completed {len(full_scan_tasks)} parallel full scans")
-            else:
-                logger.info("All scan tasks were full scans. No quick scan results to evaluate.")
-
-
-        except Exception as e:
-            error_msg = f"Critical error in optimized scan: {str(e)}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-
-        scan_end = datetime.now()
-        scan_duration = (scan_end - scan_start).total_seconds()
-
-        result = OptimizedScanResult(
-            network_cidr=network_cidr,
-            scan_start=scan_start,
-            scan_end=scan_end,
-            total_hosts_attempted=len(live_hosts) if 'live_hosts' in locals() else 0,
-            successful_scans=successful_scans,
-            failed_scans=failed_scans,
-            new_devices=new_devices,
-            devices_with_changes=devices_with_changes,
-            total_ports_discovered=total_ports,
-            parallel_workers_used=self.max_workers,
-            errors=errors
-        )
-
-        logger.info(f"Optimized scan completed in {scan_duration:1.1f}s: "
-                        f"{result.successful_scans}/{result.total_hosts_attempted} hosts scanned successfully")
+        Returns:
+            Tuple of (ip_address, is_alive, error_message)
+        """
+        try:
+            if not PING_AVAILABLE:
+                # Fallback to subprocess ping if pythonping not available
+                import subprocess
+                result = subprocess.run(
+                    ['ping', '-c', '1', '-W', str(self.ping_timeout), ip_address],
+                    capture_output=True,
+                    timeout=self.ping_timeout + 1
+                )
+                return (ip_address, result.returncode == 0, None)
             
-        return result
+            # Use pythonping for async ping
+            loop = asyncio.get_event_loop()
 
-    def _discover_hosts_parallel(self, network_cidr: str) -> List[str]:
-        """
-        Discover live hosts using parallel ping scans.
-        
-        Strategy: Split network into smaller chunks and scan in parallel.
-        """
-        try:
-            network = ipaddress.IPv4Network(network_cidr, strict=False)
-            all_ips = [str(ip) for ip in network.hosts()]
-
-            live_hosts = []
-
-            if len(all_ips) <= 5:
-                live_hosts = all_ips
-
-            # Split IPs into chunks for parallel processing
-            chunk_size = max(1, len(all_ips) // self.max_workers)
-            ip_chunks = [all_ips[i:i + chunk_size] for i in range(0, len(all_ips), chunk_size)]
-
-            # Parallel discovery
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_chunk = {
-                    executor.submit(self._scan_ip_chunk_for_discovery, chunk): chunk
-                    for chunk in ip_chunks
-                }
-
-                for future in as_completed(future_to_chunk):
-                    try:
-                        chunk_results = future.result(timeout=self.discovery_timeout)
-                        live_hosts.extend(chunk_results)
-                    except Exception as e:
-                        logger.error(f"Discovery chunk failed: {str(e)}")
-
-            return sorted(live_hosts, key=lambda ip: ipaddress.IPv4Address(ip))
-
-        except Exception as e:
-            logger.error(f"Parallel host discovery failed: {str(e)}")
-            raise
-
-    def _scan_ip_chunk_for_discovery(self, ip_chunk: List[str]) -> List[str]:
-        nm = self._get_nmap_scanner()
-        try:
-            nm.scan(hosts=' '.join(ip_chunk), arguments='-sn')
-            return [
-                ip for ip in ip_chunk
-                if ip in nm.all_hosts() and nm[ip].state() == 'up'
-            ]
-        except Exception as e:
-            logger.debug(f"Chunk scan failed: {e}")
-            return []
-
-    def _create_scan_tasks(self, live_hosts: List[str], network_id: int) -> List[ScanTask]:
-        """
-        Create scan tasks using smart scan logic.
-        
-        Smart Logic:
-        1. New devices → Full scan immediately
-        2. Known devices → Quick scan first (always)
-        3. After quick scan → Check for changes → Full scan if needed
-        """
-        tasks = []
-
-        for ip in live_hosts:
-            # Check if device exists and get its status
-            existing_device = self.db.find_device_by_ip(ip)
-
-            if existing_device is None:
-                # New device - highest priority, needs full scan
-                logger.info(f"Scanning {ip} with full scan")
-                tasks.append(ScanTask(
-                    ip_address=ip,
-                    device_id=None,
-                    scan_type='full',
-                    network_id=network_id,
-                    priority=1
-                ))
-            else:
-                # Determine scan type based on port/service change
-                logger.info(f"Known device: {ip} (last scanned: {existing_device.last_scanned})")
-                tasks.append(ScanTask(
-                    ip_address=ip,
-                    device_id=existing_device.device_id,
-                    scan_type='quick',
-                    network_id=network_id,
-                    priority=2
-                ))
-
-        # Sort tasks by priority (lower number = higher priority)
-        tasks.sort(key=lambda x: x.priority)
-
-        logger.info(f"Smart scan tasks created: "
-                   f"New devices (full): {sum(1 for t in tasks if t.scan_type == 'full')}, "
-                   f"Known devices (quick first): {sum(1 for t in tasks if t.scan_type == 'quick')}")
-        
-        return tasks
-    
-    def _execute_scan_tasks_parallel(self, tasks: List[ScanTask]) -> List[Dict]:
-        """Execute scan tasks in parallel with proper error handling."""
-        results = []
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all tasks
-            future_to_task = {
-                executor.submit(self._execute_single_scan_task, task): task
-                for task in tasks
-            }
-
-            # Collect results as they complete
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
+            # Run ping in thread pool to avoid blocking
+            def do_ping():
                 try:
-                    result = future.result(timeout=self.scan_timeout)
-                    results.append(result)
+                    response = ping(ip_address, count=self.ping_count, timeout=self.ping_timeout)
+                    return response.success()
                 except Exception as e:
-                    error_result = {
-                        'success': False,
-                        'ip_address': task.ip_address,
-                        'scan_type': task.scan_type,
-                        'error': f"Scan task failed: {str(e)}"
-                    }
-                    results.append(error_result)
-                    logger.error(f"Scan task failed for {task.ip_address}: {str(e)}")
-            return results
-        
-    def _execute_single_scan_task(self, task: ScanTask) -> Dict:
-        """Execute a single scan task (thread worker function)."""
-        try:
-            nm = self._get_nmap_scanner()
+                    logger.debug(f"Ping failed for {ip_address}: {e}")
+                    return False
+                
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                is_alive = await loop.run_in_executor(executor, do_ping)
 
-            # Choose scan arguments based on task type
-            if task.scan_type == 'quick':
-                nmap_args = '-sV --top-ports 1000 -T4'
-                timeout = 60
-            elif task.scan_type == 'full':
+            return (ip_address, is_alive, None)
+        
+        except Exception as e:
+            error_msg = f"Ping error for {ip_address}: {str(e)}"
+            logger.debug(error_msg)
+            return (ip_address, False, error_msg)
+        
+    async def discover_live_hosts(self, network_cidr: str) -> Tuple[List[str], List[str]]:
+        """
+        Discover live hosts using async pings with graceful error handling.
+        
+        Args:
+            network_cidr: Network range to scan
+            
+        Returns:
+            Tuple of (live_hosts, error_messages)
+        """
+        try:
+            logger.info(f"Starting async host discovery for {network_cidr}")
+            discovery_start = time.time()
+
+            # Generate list of IPs to ping
+            network = ipaddress.IPv4Network(network_cidr, strict=False)
+            ip_list = [str(ip) for ip in network.hosts()]
+
+            if len(ip_list) > 1000:
+                logger.warning(f"Large network detected ({len(ip_list)} hosts). "
+                              "Consider scanning in smaller chunks for better performance.")
+                
+            # Create ping tasks
+            ping_tasks = [self.ping_host_async(ip) for ip in ip_list]
+
+            # Execute all pings concurrently
+            ping_results = await asyncio.gather(*ping_tasks, return_exceptions=True)
+
+            # Process results
+            live_hosts = []
+            errors = []
+
+            for result in ping_results:
+                if isinstance(result, Exception):
+                    errors.append(f"Ping task failed: {str(result)}")
+                    continue
+
+                ip, is_alive, error = result
+                if error:
+                    errors.append(error)
+                elif is_alive:
+                    live_hosts.append(ip)
+
+            discovery_duration = time.time() - discovery_start
+            logger.info(f"Async host discovery completed in {discovery_duration:.2f}s: "
+                       f"{len(live_hosts)} live hosts found out of {len(ip_list)} total")
+            
+            # Sort IPs for consistent processing order
+            live_hosts.sort(key=lambda ip: ipaddress.IPv4Address(ip))
+            
+            return live_hosts, errors
+        
+        except Exception as e:
+            error_msg = f"Host discovery failed for {network_cidr}: {str(e)}"
+            logger.error(error_msg)
+            return [], [error_msg]
+        
+    def scan_device_ports(self, ip_address: str, scan_type: str = 'quick') -> HostScanResult:
+        """
+        Thread-safe version of device port scanning.
+        
+        This method is designed to be called from multiple threads simultaneously.
+        
+        Args:
+            ip_address: IP address to scan
+            scan_type: 'quick' or 'full'
+            
+        Returns:
+            HostScanResult with discovered ports and services
+        """
+        nm = self._get_nmap_instance()  # Thread-local Nmap instance
+
+        try:
+            logger.debug(f"[Thread-{threading.current_thread().ident}] Scanning {ip_address} (type: {scan_type})")
+
+            if scan_type == 'full':
                 nmap_args = '-sV -sC --version-all -p- -T4'
                 timeout = self.scan_timeout
             else:
@@ -343,225 +241,304 @@ class OptimizedNetworkScanner:
                 timeout = 60
 
             # Perform the scan
-            start_time = time.time()
-            nm.scan(hosts=task.ip_address, arguments=nmap_args, timeout=timeout)
-            scan_duration = time.time() - start_time
+            scan_start = time.time()
+            nm.scan(hosts=ip_address, arguments=nmap_args, timeout=timeout)
+            scan_duration = time.time() - scan_start
 
-            # Process results
-            if task.ip_address not in nm.all_hosts():
-                return {
-                    'success': False,
-                    'ip_address': task.ip_address,
-                    'scan_type': task.scan_type,
-                    'error': 'Host did not respond'
-                }
+            # Check if host responded
+            if ip_address not in nm.all_hosts():
+                logger.debug(f"Host {ip_address} did not respond to port scan")
+                return HostScanResult(
+                    ip_address=ip_address,
+                    is_alive=False,
+                    ports=[],
+                    scan_error="Host did not respond to port scan",
+                    scan_duration=scan_duration
+                )
+        
+            # Process scan results
+            host_info = nm[ip_address]
+
+            hostname = None
+            mac_address = None
+
+            if 'hostnames' in host_info and host_info['hostnames']:
+                hostname = host_info['hostnames'][0]['name']
             
-            host_info = nm[task.ip_address]
+            if 'addresses' in host_info and 'mac' in host_info['addresses']:
+                mac_address = host_info['addresses']['mac']
 
-            # Extract port info
             ports = []
             for protocol in host_info.all_protocols():
                 ports_dict = host_info[protocol]
+
                 for port_num, port_info in ports_dict.items():
+                    #logger.debug(f"Raw port_info for {ip_address}:{port_num}: {port_info}")
                     if port_info['state'] == 'open':
-                        ports.append({
+                        port_data = {
                             'port_number': port_num,
                             'protocol': protocol,
                             'state': port_info['state'],
                             'service_name': port_info.get('name', ''),
                             'service_version': port_info.get('version', ''),
                             'service_product': port_info.get('product', ''),
-                            'service_cpe': port_info['cpe'],
-                            'service_extrainfo': port_info['extrainfo'],
-                            'service_conf': port_info['conf'],
-                        })
-
-            # Extract hostname and MAC
-            hostname = None
-            mac_address = None
-
-            if 'hostnames' in host_info and host_info['hostnames']:
-                hostname = host_info['hostnames'][0]['name']
-
-            if 'addresses' in host_info and 'mac' in host_info['addresses']:
-                mac_address = host_info['addresses']['mac']
-
-            return {
-                'success': True,
-                'ip_address': task.ip_address,
-                'device_id': task.device_id,
-                'scan_type': task.scan_type,
-                'ports': ports,
-                'hostname': hostname,
-                'mac_address': mac_address,
-                'scan_duration': scan_duration,
-                'network_id': task.network_id
-            }
-
-        except Exception as e:
-            return {
-                'success': False,
-                'ip_address': task.ip_address,
-                'scan_type': task.scan_type,
-                'error': str(e)
-            }
-        
-    def _process_scan_result_without_full_scan(self, scan_result: Dict, network_id: int) -> Dict:
-        """
-        Process scan result WITHOUT triggering full scans.
-        
-        This handles the quick scan results and identifies which devices need full scans,
-        but doesn't execute them (that's done in parallel later).
-        """
-        try:
-            ip = scan_result['ip_address']
-            ports = scan_result['ports']
-            hostname = scan_result.get('hostname')
-            mac_address = scan_result.get('mac_address')
-            device_id = scan_result.get('device_id')
-            scan_type = scan_result['scan_type']
-
-            # Add or update device
-            if device_id is None:
-                # New device (this was already a full scan)
-                device_id = self.db.add_or_update_device(network_id, ip, mac_address, hostname)
-                is_new_device = True
-                ports_changed = False  # New device, so no "change" comparison
-            else:
-                # Update existing device
-                self.db.add_or_update_device(network_id, ip, mac_address, hostname)
-                is_new_device = False
+                            'service_extrainfo': port_info.get('extrainfo', ''),
+                            'service_cpe': port_info.get('cpe', 'blank'),
+                            'confidence': port_info.get('conf', '')
+                        }
+                        #logger.debug(f"Raw port_data for {ip_address}:{port_num}: {port_data}")
+                        ports.append(port_data)
                 
-                # Check for port changes (CORE LOGIC!)
-                ports_changed = self.db.update_device_ports(device_id, ports)
-                
-                if scan_type == 'quick' and ports_changed:
-                    logger.info(f"Changes detected on {ip}, will schedule for parallel full scan")
+            logger.debug(f"[Thread-{threading.current_thread().ident}] "
+                        f"Scan completed for {ip_address} in {scan_duration:.1f}s: {len(ports)} open ports")
+            
+            return HostScanResult(
+                ip_address=ip_address,
+                is_alive=True,
+                ports=ports,
+                hostname=hostname,
+                mac_address=mac_address,
+                scan_duration=scan_duration
+            )
 
-            return {
-                'success': True,
-                'device_id': device_id,
-                'is_new_device': is_new_device,
-                'ports_changed': ports_changed,
-                'port_count': len(ports)
-            }
-        
         except Exception as e:
-            logger.error(f"Failed to process scan result for {scan_result.get('ip_address', 'unknown')}: {str(e)}")
-            return {
-                'success': False,
-                'device_id': None,
-                'is_new_device': False,
-                'ports_changed': False,
-                'port_count': 0
-            }
-
-    def _process_full_scan_result(self, full_scan_result: Dict, network_id: int) -> Dict:
-        """
-        Process full scan results (triggered by change detection).
+            error_msg = f"Port scan failed for {ip_address}: {str(e)}"
+            logger.error(error_msg)
+            return HostScanResult(
+                ip_address=ip_address,
+                is_alive=False,
+                ports=[],
+                scan_error=error_msg,
+                scan_duration=time.time() - scan_start if 'scan_start' in locals() else 0
+            )
         
-        This updates the database with comprehensive port information.
+    async def scan_network_optimized(self, network_cidr: str, network_id: int) -> ScanResult:
         """
+        Perform optimized network scan using async pings and threaded Nmap scans.
+        
+        This is the main method that implements your hybrid approach:
+        1. Async ping discovery
+        2. Threaded port scanning
+        3. Smart scan logic maintained
+        
+        Args:
+            network_cidr: Network to scan
+            network_id: Database ID of the network
+            
+        Returns:
+            ScanResult with performance statistics
+        """
+        scan_start = datetime.now()
+        errors = []
+        new_devices = 0
+        devices_needing_full_scan = 0
+        total_ports = 0
+        
+        # Performance tracking
+        perf_stats = {
+            'discovery_time': 0.0,
+            'scanning_time': 0.0,
+            'database_time': 0.0
+        }
+        
+        logger.info(f"Starting optimized network scan of {network_cidr}")
+        
         try:
-            ip = full_scan_result['ip_address']
-            ports = full_scan_result['ports']
-            hostname = full_scan_result.get('hostname')
-            mac_address = full_scan_result.get('mac_address')
-            device_id = full_scan_result['device_id']
+            # Phase 1: Async Host Discovery
+            discovery_start = time.time()
+            live_hosts, discovery_errors = await self.discover_live_hosts(network_cidr)
+            perf_stats['discovery_time'] = time.time() - discovery_start
             
-            # Update device info (might have gotten more details from full scan)
-            self.db.add_or_update_device(network_id, ip, mac_address, hostname)
+            errors.extend(discovery_errors)
             
-            # Get current port count before update
-            existing_device = self.db.find_device_by_ip(ip)
-            old_port_count = len(existing_device.ports) if existing_device else 0
+            if not live_hosts:
+                logger.warning("No live hosts found")
+                return ScanResult(
+                    network_cidr=network_cidr,
+                    scan_start=scan_start,
+                    scan_end=datetime.now(),
+                    live_hosts_found=0,
+                    new_devices=0,
+                    devices_needing_full_scan=0,
+                    total_ports_discovered=0,
+                    errors=errors,
+                    performance_stats=perf_stats
+                )
             
-            # Update with full scan results
-            self.db.update_device_ports(device_id, ports)
+            # Phase 2: Threaded Port Scanning with Smart Logic
+            scanning_start = time.time()
+            thread_count = self._calculate_thread_count(len(live_hosts))
+            logger.info(f"Using {thread_count} threads for scanning {len(live_hosts)} hosts")
             
-            additional_ports = len(ports) - old_port_count
-            logger.info(f"Full scan completed for {ip}: {len(ports)} total ports ({additional_ports:+d} from quick scan)")
+            # Prepare scanning tasks
+            scan_tasks = []
             
-            return {
-                'success': True,
-                'additional_ports': max(0, additional_ports)  # Don't count negative (shouldn't happen)
-            }
+            # First, classify all devices (sequential for database safety)
+            db_start = time.time()
+            device_scan_plan = {}  # ip -> (device_id, scan_type)
+            
+            for ip in live_hosts:
+                existing_device = self.db.find_device_by_ip(ip)
+                
+                if existing_device is None:
+                    # New device - add to database and plan full scan
+                    device_id = self.db.add_or_update_device(network_id, ip)
+                    device_scan_plan[ip] = (device_id, 'full')
+                    new_devices += 1
+                else:
+                    # Known device - plan quick scan first
+                    device_scan_plan[ip] = (existing_device.device_id, 'quick')
+            
+            perf_stats['database_time'] += time.time() - db_start
+            
+            # Execute initial scans in parallel (both quick scans and full scans for new devices)
+            initial_scan_futures = {}
+            with ThreadPoolExecutor(max_workers=thread_count) as executor:
+                for ip, (device_id, scan_type) in device_scan_plan.items():
+                    if scan_type == 'quick':
+                        future = executor.submit(self.scan_device_ports, ip, 'quick')
+                        initial_scan_futures[future] = (ip, device_id, 'quick')
+                    else:
+                        # New devices get full scan immediately
+                        future = executor.submit(self.scan_device_ports, ip, 'full')
+                        initial_scan_futures[future] = (ip, device_id, 'full')
+                
+                # Process initial scan results and determine additional full scans needed
+                full_scan_tasks = []
+                
+                for future in as_completed(initial_scan_futures):
+                    ip, device_id, original_scan_type = initial_scan_futures[future]
+                    
+                    try:
+                        scan_result = future.result()
+                        
+                        if scan_result.ports:
+                            # Update database
+                            db_start = time.time()
+                            ports_changed = self.db.update_device_ports(device_id, scan_result.ports)
+                            perf_stats['database_time'] += time.time() - db_start
+                            
+                            total_ports += len(scan_result.ports)
+                            
+                            # Only check for changes if this was originally a quick scan
+                            if original_scan_type == 'quick' and ports_changed:
+                                logger.info(f"Port changes detected on {ip}, scheduling full scan")
+                                devices_needing_full_scan += 1
+                                full_scan_tasks.append((ip, device_id))
+                            elif original_scan_type == 'full':
+                                # New device - full scan already completed, nothing more to do
+                                logger.info(f"Full scan completed for new device {ip}: {len(scan_result.ports)} ports found")
+                        
+                    except Exception as e:
+                        error_msg = f"Error processing scan result for {ip}: {str(e)}"
+                        logger.error(error_msg)
+                        errors.append(error_msg)
+                
+                # Execute full scans for devices with detected changes
+                if full_scan_tasks:
+                    logger.info(f"Performing {len(full_scan_tasks)} full scans for devices with changes")
+                    
+                    full_scan_futures = {}
+                    for ip, device_id in full_scan_tasks:
+                        future = executor.submit(self.scan_device_ports, ip, 'full')
+                        full_scan_futures[future] = (ip, device_id)
+                    
+                    for future in as_completed(full_scan_futures):
+                        ip, device_id = full_scan_futures[future]
+                        
+                        try:
+                            full_scan_result = future.result()
+                            
+                            if full_scan_result.ports:
+                                db_start = time.time()
+                                self.db.update_device_ports(device_id, full_scan_result.ports)
+                                perf_stats['database_time'] += time.time() - db_start
+                                
+                                # Update total port count (replace quick scan count)
+                                total_ports += len(full_scan_result.ports)
+                                
+                        except Exception as e:
+                            error_msg = f"Error in full scan for {ip}: {str(e)}"
+                            logger.error(error_msg)
+                            errors.append(error_msg)
+            
+            perf_stats['scanning_time'] = time.time() - scanning_start
             
         except Exception as e:
-            logger.error(f"Failed to process full scan result for {full_scan_result.get('ip_address', 'unknown')}: {str(e)}")
-            return {
-                'success': False,
-                'additional_ports': 0
-            }
-
-    def _create_empty_result(self, network_cidr: str, scan_start: datetime, reason: str) -> OptimizedScanResult:
-        """Create an empty result for failed scans."""
-        return OptimizedScanResult(
+            error_msg = f"Critical error during optimized scan: {str(e)}"
+            logger.error(error_msg)
+            errors.append(error_msg)
+        
+        scan_end = datetime.now()
+        total_duration = (scan_end - scan_start).total_seconds()
+        
+        result = ScanResult(
             network_cidr=network_cidr,
             scan_start=scan_start,
-            scan_end=datetime.now(),
-            total_hosts_attempted=0,
-            successful_scans=0,
-            failed_scans=0,
-            new_devices=0,
-            devices_with_changes=0,
-            total_ports_discovered=0,
-            parallel_workers_used=self.max_workers,
-            errors=[reason]
+            scan_end=scan_end,
+            live_hosts_found=len(live_hosts) if 'live_hosts' in locals() else 0,
+            new_devices=new_devices,
+            devices_needing_full_scan=devices_needing_full_scan,
+            total_ports_discovered=total_ports,
+            errors=errors,
+            performance_stats=perf_stats
         )
-    
-    def get_performance_metrics(self, network_id: int) -> Dict:
-        """Get performance and efficiency metrics for the network."""
-        with self.db.get_connection() as conn:
-            # Calculate scan efficiency metrics
-            metrics = conn.execute("""
-                SELECT 
-                    COUNT(*) as total_devices,
-                    AVG(julianday('now') - julianday(last_scanned)) as avg_days_since_scan,
-                    COUNT(CASE WHEN scan_status = 'full_scan_needed' THEN 1 END) as needs_full_scan,
-                    COUNT(CASE WHEN last_scanned > datetime('now', '-1 day') THEN 1 END) as scanned_recently
-                FROM devices 
-                WHERE network_id = ?
-            """, (network_id,)).fetchone()
-            
-            return {
-                'total_devices': metrics['total_devices'],
-                'average_days_since_scan': round(metrics['avg_days_since_scan'] or 0, 2),
-                'devices_needing_full_scan': metrics['needs_full_scan'],
-                'devices_scanned_recently': metrics['scanned_recently'],
-                'scan_efficiency': round((metrics['scanned_recently'] / max(metrics['total_devices'], 1)) * 100, 1)
-            }
         
+        logger.info(f"Optimized scan completed in {total_duration:.1f}s "
+                   f"(discovery: {perf_stats['discovery_time']:.1f}s, "
+                   f"scanning: {perf_stats['scanning_time']:.1f}s, "
+                   f"database: {perf_stats['database_time']:.1f}s)")
+        logger.info(f"Results: {result.live_hosts_found} hosts, {result.new_devices} new devices, "
+                   f"{result.total_ports_discovered} total ports")
+        
+        return result
+    
+
 if __name__ == "__main__":
-    # Initialize optimized scanner
-    db = NetworkDatabase("src/database/network_scanner.db")
+    import asyncio
     
-    # Test different worker configurations
-    for workers in [10, 20]:
-        print(f"\n=== Testing with {workers} workers ===")
-        scanner = OptimizedNetworkScanner(db, max_workers=workers)
+    # Initialize database and scanner
+    db = NetworkDatabase("src/database/network_scanner.db")
+    scanner = OptimizedNetworkScanner(db)
+    
+    # Set up test data
+    with db.get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO customers (customer_name, contact_email) VALUES (?, ?)",
+                    ("Test Company", "admin@testcompany.com"))
         
-        # Set up test network
-        with db.get_connection() as conn:
-            conn.execute("INSERT OR IGNORE INTO customers (customer_name) VALUES (?)", ("Test Company",))
-            cursor = conn.execute("INSERT OR IGNORE INTO networks (customer_id, network_cidr, description) VALUES (?, ?, ?)",
-                                 (1, "192.168.1.0/24", f"Test network - {workers} workers"))
-            network_id = cursor.lastrowid or 1
-            conn.commit()
-        
-        # Run performance test
-        start_time = time.time()
+        cursor = conn.execute("INSERT OR IGNORE INTO networks (customer_id, network_cidr, description) VALUES (?, ?, ?)",
+                             (1, "127.0.0.1/30", "Test network"))
+        network_id = cursor.lastrowid or 1
+        conn.commit()
+    
+    async def run_test():
         try:
-            result = scanner.scan_network_optimized("192.168.1.0/24", network_id)
-            duration = time.time() - start_time
+            test_network = "127.0.0.1/30"
             
-            print(f"Scan completed in {duration:.2f}s")
-            print(f"Success rate: {result.successful_scans}/{result.total_hosts_attempted}")
-            print(f"Performance: {result.successful_scans/duration:.2f} hosts/second")
+            print(f"Starting optimized scan of {test_network}...")
+            print("Performance comparison will be shown...")
             
-            # Get efficiency metrics
-            metrics = scanner.get_performance_metrics(network_id)
-            print(f"Scan efficiency: {metrics['scan_efficiency']}%")
+            result = await scanner.scan_network_optimized(test_network, network_id)
+            
+            print(f"\nOptimized Scan Results:")
+            print(f"- Total duration: {(result.scan_end - result.scan_start).total_seconds():.2f}s")
+            print(f"- Discovery time: {result.performance_stats['discovery_time']:.2f}s")
+            print(f"- Scanning time: {result.performance_stats['scanning_time']:.2f}s")
+            print(f"- Database time: {result.performance_stats['database_time']:.2f}s")
+            print(f"- Live hosts: {result.live_hosts_found}")
+            print(f"- New devices: {result.new_devices}")
+            print(f"- Full scans needed: {result.devices_needing_full_scan}")
+            print(f"- Total ports: {result.total_ports_discovered}")
+            
+            if result.errors:
+                print(f"- Errors: {len(result.errors)}")
+                for error in result.errors[:3]:  # Show first 3 errors
+                    print(f"  * {error}")
             
         except Exception as e:
             print(f"Test failed: {e}")
+            print("Note: Install pythonping with: pip install pythonping")
+            print("      Adjust test_network to a range you can scan")
+    
+    # Run the async test
+    asyncio.run(run_test())

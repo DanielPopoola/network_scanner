@@ -1,5 +1,5 @@
 import sqlite3
-import logging
+from logger_config import setup_logger
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,8 +7,9 @@ from typing import List, Optional, Dict, Any
 import time
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logs = 'logs/database.log'
+logger = setup_logger(__name__, log_file_path=logs)
+
 
 @dataclass
 class DeviceInfo:
@@ -298,9 +299,10 @@ class NetworkDatabase:
 
             # Then add all current ports
             port_insert_sql = """
-            INSERT INTO ports (device_id, port_number, protocol, service_name, service_version, state)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """
+            INSERT INTO ports (device_id, port_number, protocol, service_name, service_version, 
+                   service_product, service_extrainfo, service_cpe, confidence, state) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """ 
 
             for port in new_ports:
                 conn.execute(port_insert_sql, (
@@ -309,6 +311,10 @@ class NetworkDatabase:
                     port['protocol'],
                     port.get('service_name'),
                     port.get('service_version'),
+                    port.get('service_product'),
+                    port.get('service_extrainfo'),
+                    port.get('service_cpe'),
+                    port.get('confidence'),
                     port['state']
                 ))
 
