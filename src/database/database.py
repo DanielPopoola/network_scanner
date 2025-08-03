@@ -125,6 +125,8 @@ class NetworkDatabase:
             service_version TEXT,
             service_product TEXT,
             service_extrainfo TEXT,
+            service_cpe TEXT,
+            confidence INTEGER,
             state TEXT NOT NULL,
             FOREIGN KEY (device_id) REFERENCES devices (device_id)
             UNIQUE(device_id, port_number, protocol)
